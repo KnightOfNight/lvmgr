@@ -1,0 +1,234 @@
+#!/usr/bin/perl
+
+
+use strict;
+use warnings;
+
+use Digest::MD5 qw/md5_hex/;
+use Getopt::Long;
+
+use lib "/home/ctg/bin";
+use LVDB;
+use LV;
+use TGTD;
+
+
+my $add = "";
+my $remove = "";
+my $list = "";
+my $size = 0;
+my $iscsi = 0;
+my $help;
+
+
+my $go_res = GetOptions(
+	"add=s" => \$add,
+	"remove=s" => \$remove,
+	"list" => \$list,
+	"size=i" => \$size,
+	"iscsi" => \$iscsi,
+	"help" => \$help
+);
+
+
+if ( !$go_res || (!$add && !$remove &&!$list) || $help ) {
+	print <<EOUSAGE;
+
+lvmgr { --add <description> | --remove <uuid> | --list }
+
+
+ADD MODE OPTIONS
+<description>  Description of the volume as a human readable string
+--size <GB>    Size of the new volume in gigabytes
+--iscsi        Setup a config file for ISCSI tgtd
+
+
+REMOVE MODE OPTIONS
+<uuid>         UUID of the volume to be deleted
+NONE
+
+
+LIST MODE OPTIONS
+NONE
+
+EOUSAGE
+	exit(0);
+}
+
+
+if ( $add && ($size < 5) ) {
+	printf("ERROR: size must be larger than 5GB\n");
+	exit(-1);
+}
+				
+
+
+my $lvdb = new LVDB;
+my $lv = new LV("vg1");
+my $tgtd = new TGTD("/etc/tgt/lv", "vg1");
+
+
+
+#
+# LIST
+#
+if ( $list ) {
+
+	my @lvdb_data = $lvdb->dbread();
+	my @lv_data = $lv->vol_list();
+
+	printf("\nCurrent Volumes\n\n");
+	printf("UUID                              Size       Description\n");
+	printf("===========================================================================================\n");
+
+	map {
+
+		my $record = $_;
+
+		my $uuid = $record;
+		my $desc = $record;
+		$uuid =~ s/ .*$//;
+		$desc =~ s/^[\da-f]{32} //;
+
+		my $size = $lv->vol_size($uuid);
+
+		my $flags = '';
+		if ($lv->vol_shared_netatalk($uuid)) {
+			if ($flags) { $flags .= ' '; }
+			$flags .= 'ShNtt';
+		}
+		if ($lv->vol_mounted($uuid)) {
+			if ($flags) { $flags .= ' '; }
+			$flags .= 'Mnt';
+		}
+		if ($lv->vol_fstab_entry($uuid)) {
+			if ($flags) { $flags .= ' '; }
+			$flags .= 'FS';
+		}
+
+		printf("%s  %-9s  %s (%s)\n", $uuid, $size, $desc, $flags);
+
+	} @lvdb_data;
+
+	printf("===========================================================================================\n");
+	printf("\n");
+
+	exit(0);
+
+}
+
+
+
+#
+# ADD
+# 
+if ( my $desc = $add ) {
+
+	my $uuid = $lvdb->desc2uuid($desc);
+
+	if ( $lv->vol_search($uuid) || $lvdb->vol_exists($uuid) ) {
+		printf("Volume '$desc' UUID $uuid already exists.\n");
+		exit(-1);
+	}
+
+
+	printf("Volume will be added.\n");
+	printf("Description: $desc\n");
+	printf("UUID: $uuid\n");
+	printf("Size: %dGB\n", $size);
+
+	if ( ! $lvdb->vol_add($uuid, $desc) ) {
+		printf( "Unable to add LVDB entry...\n" );
+		printf( "%s\n", $lvdb->error() );
+		exit(-1);
+	}
+
+	if ( ! $lv->vol_add($uuid, $size) ) {
+		printf( "Unable to add logical volume...\n" );
+		printf( "%s\n", $lv->error() );
+
+		printf( "Trying to remove LVDB entry...\n" );
+		if ( ! $lvdb->vol_remove($uuid) ) {
+			printf( "%s\n", $lvdb->error() );
+		}
+
+		exit(-1);
+	}
+
+	if ( $iscsi ) {
+		if ( $tgtd->cfg_add($uuid) ) {
+			printf("Reloading tgtd config...\n");
+			$tgtd->cfg_reload();
+
+		} else {
+			printf( "%s\n", $tgtd->error() );
+		}
+	}
+
+	printf("Done.\n");
+
+	exit(0);
+
+}
+
+
+#
+# REMOVE
+#
+if ( my $uuid = $remove ) {
+
+	if ( ! $lvdb->vol_exists($uuid) ) {
+		printf("UUID '$uuid' does not exist.\n");
+		exit(-1);
+	}
+
+	my $desc = $lvdb->vol_desc($uuid);
+	my $size = $lv->vol_size($uuid);
+
+	if ( $lv->vol_shared_netatalk($uuid) ) {
+		printf("ERROR: $desc ($uuid) is being shared by Netatalk.\n");
+		exit(-1);
+	}
+
+	if ( $lv->vol_mounted($uuid) ) {
+		printf("ERROR: $desc ($uuid) is mounted.\n");
+		exit(-1);
+	}
+
+	if ( $lv->vol_fstab_entry($uuid) ) {
+		printf("ERROR: $desc ($uuid) is in /etc/fstab.\n");
+		exit(-1);
+	}
+
+	printf("Volume will be removed.\n");
+	printf("Description: $desc\n");
+	printf("UUID: $uuid\n");
+	printf("Size: $size\n");
+
+	if ( $tgtd->cfg_remove($uuid) ) {
+		printf("Reloading tgtd config...\n");
+		$tgtd->cfg_reload();
+	}
+
+	if ( ! $lv->vol_remove($uuid) ) {
+		printf( "Unable to remove logical volume...\n" );
+		printf( "%s\n", $lv->error() );
+		exit(-1);
+	}
+
+	if ( ! $lvdb->vol_remove($uuid) ) {
+		printf( "Unable to remove LVDB entry...\n" );
+		printf( "%s\n", $lvdb->error() );
+		exit(-1);
+	}
+
+	printf("Done.\n");
+
+	exit(0);
+
+}
+
+
+exit(-1);
+
+
